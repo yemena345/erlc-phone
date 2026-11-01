@@ -1,4 +1,3 @@
-
 const express = require('express')
 const http = require('http')
 const { Server } = require('socket.io')
@@ -6,14 +5,65 @@ const { Server } = require('socket.io')
 const app = express()
 const server = http.createServer(app)
 
-const io = new Server(server, {
-cors: {
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'https://erlc-phone.vercel.app'
+const allowedOrigins = [
+  'https://erlc-phone.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:5174'
+]
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin
+
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+  }
+
+  res.setHeader('Vary', 'Origin')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+
+  if (req.method === 'OPTIONS') return res.sendStatus(204)
+  next()
+})
+
+app.get('/ice-config', (req, res) => {
+  const username = process.env.TURN_USERNAME
+  const credential = process.env.TURN_PASSWORD
+
+  const iceServers = [
+    { urls: 'stun:stun.relay.metered.ca:80' }
   ]
-}
+
+  if (username && credential) {
+    iceServers.push(
+      {
+        urls: 'turn:global.relay.metered.ca:80',
+        username,
+        credential
+      },
+      {
+        urls: 'turn:global.relay.metered.ca:80?transport=tcp',
+        username,
+        credential
+      },
+      {
+        urls: 'turn:global.relay.metered.ca:443',
+        username,
+        credential
+      },
+      {
+        urls: 'turns:global.relay.metered.ca:443?transport=tcp',
+        username,
+        credential
+      }
+    )
+  }
+
+  res.json({ iceServers })
+})
+
+const io = new Server(server, {
+  cors: { origin: allowedOrigins }
 })
 
 const utenti = new Map()
@@ -25,8 +75,8 @@ io.on('connection', socket => {
 
     if (!/^\d{6}$/.test(n)) return
 
-    // Se lo stesso numero era già collegato, sostituisce la vecchia connessione.
     const precedente = utenti.get(n)
+
     if (precedente && precedente !== socket.id) {
       io.to(precedente).emit('disconnected')
       occupati.delete(precedente)
@@ -82,12 +132,13 @@ io.on('connection', socket => {
 
   socket.on('reject-call', ({ to }) => {
     const destinatario = utenti.get(String(to))
+
     if (destinatario) {
       io.to(destinatario).emit('call-rejected')
+      occupati.delete(destinatario)
     }
 
     occupati.delete(socket.id)
-    if (destinatario) occupati.delete(destinatario)
   })
 
   socket.on('end-call', () => {
