@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from 'react'
 import { io } from 'socket.io-client'
 import './App.css'
 
-const socket = io('http://localhost:3001', {
+const socket = io('https://erlc-phone-1.onrender.com', {
   autoConnect: false
 })
 
