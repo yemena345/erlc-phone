@@ -3,8 +3,11 @@ import { useState, useEffect, useRef } from 'react'
 import { io } from 'socket.io-client'
 import './App.css'
 
-const socket = io('https://erlc-phone-1.onrender.com', {
-  autoConnect: false
+const SERVER = 'https://erlc-phone-1.onrender.com'
+
+const socket = io(SERVER, {
+  autoConnect: false,
+  transports: ['websocket', 'polling']
 })
 
 export default function App() {
@@ -23,15 +26,83 @@ export default function App() {
   })
 
   const [chiamataEntrante, setChiamataEntrante] = useState(null)
-  const [chiamante, setChiamante] = useState('')
   const [connesso, setConnesso] = useState(false)
 
   const peerRef = useRef(null)
   const streamRef = useRef(null)
   const numeroChiamataRef = useRef('')
-  const offertaRef = useRef(null)
+  const candidatiRef = useRef([])
 
   const tasti = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#']
+
+  async function creaPeer() {
+    const response = await fetch(`${SERVER}/ice-config`)
+
+    if (!response.ok) {
+      throw new Error('Impossibile caricare la configurazione audio')
+    }
+
+    const config = await response.json()
+    const peer = new RTCPeerConnection(config)
+
+    peer.onicecandidate = event => {
+      if (event.candidate && numeroChiamataRef.current) {
+        socket.emit('ice-candidate', {
+          to: numeroChiamataRef.current,
+          candidate: event.candidate
+        })
+      }
+    }
+
+    peer.ontrack = event => {
+      const audio = document.getElementById('audio-remoto')
+
+      if (audio) {
+        audio.srcObject = event.streams[0]
+        audio.play().catch(error => {
+          console.log('Avvia manualmente l’audio:', error)
+        })
+      }
+    }
+
+    peer.onconnectionstatechange = () => {
+      console.log('Stato audio:', peer.connectionState)
+
+      if (peer.connectionState === 'connected') {
+        setStato('Chiamata connessa')
+      }
+
+      if (peer.connectionState === 'failed') {
+        setStato('Errore nella connessione audio')
+      }
+    }
+
+    peerRef.current = peer
+    return peer
+  }
+
+  async function aggiungiCandidatiInAttesa(peer) {
+    const candidati = [...candidatiRef.current]
+    candidatiRef.current = []
+
+    for (const candidate of candidati) {
+      try {
+        await peer.addIceCandidate(new RTCIceCandidate(candidate))
+      } catch (error) {
+        console.error('Errore ICE:', error)
+      }
+    }
+  }
+
+  async function prendiMicrofono() {
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    })
+  }
 
   function chiudiChiamata(messaggio = 'Chiamata terminata') {
     if (streamRef.current) {
@@ -44,59 +115,15 @@ export default function App() {
       peerRef.current = null
     }
 
+    const audio = document.getElementById('audio-remoto')
+    if (audio) {
+      audio.srcObject = null
+    }
+
     numeroChiamataRef.current = ''
-    offertaRef.current = null
+    candidatiRef.current = []
     setChiamataEntrante(null)
-    setChiamante('')
     setStato(messaggio)
-  }
-
-  function creaPeer() {
-    const peer = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' }
-      ]
-    })
-
-    peer.onicecandidate = event => {
-      if (event.candidate && numeroChiamataRef.current) {
-        socket.emit('ice-candidate', {
-          to: numeroChiamataRef.current,
-          candidate: event.candidate
-        })
-      }
-    }
-
-    peer.ontrack = event => {
-      let audio = document.getElementById('audio-remoto')
-      if (audio) {
-        audio.srcObject = event.streams[0]
-        audio.play().catch(() => {})
-      }
-    }
-
-    peer.onconnectionstatechange = () => {
-      if (peer.connectionState === 'connected') {
-        setStato('Chiamata connessa')
-      }
-
-      if (
-        peer.connectionState === 'failed' ||
-        peer.connectionState === 'disconnected' ||
-        peer.connectionState === 'closed'
-      ) {
-        if (peerRef.current === peer) {
-          chiudiChiamata('Connessione terminata')
-        }
-      }
-    }
-
-    peerRef.current = peer
-    return peer
-  }
-
-  async function prendiMicrofono() {
-    return await navigator.mediaDevices.getUserMedia({ audio: true })
   }
 
   async function chiama() {
@@ -121,8 +148,11 @@ export default function App() {
       const stream = await prendiMicrofono()
       streamRef.current = stream
 
-      const peer = creaPeer()
-      stream.getTracks().forEach(track => peer.addTrack(track, stream))
+      const peer = await creaPeer()
+
+      stream.getTracks().forEach(track => {
+        peer.addTrack(track, stream)
+      })
 
       numeroChiamataRef.current = numero
 
@@ -133,8 +163,9 @@ export default function App() {
         to: numero,
         offer
       })
-    } catch (errore) {
-      chiudiChiamata('Impossibile avviare la chiamata. Controlla il microfono.')
+    } catch (error) {
+      console.error(error)
+      chiudiChiamata('Errore microfono o server TURN')
     }
   }
 
@@ -142,39 +173,51 @@ export default function App() {
     if (!chiamataEntrante) return
 
     try {
+      const chiamata = chiamataEntrante
+
       const stream = await prendiMicrofono()
       streamRef.current = stream
 
-      const peer = creaPeer()
-      stream.getTracks().forEach(track => peer.addTrack(track, stream))
+      const peer = await creaPeer()
 
-      numeroChiamataRef.current = chiamataEntrante.from
+      stream.getTracks().forEach(track => {
+        peer.addTrack(track, stream)
+      })
+
+      numeroChiamataRef.current = chiamata.from
 
       await peer.setRemoteDescription(
-        new RTCSessionDescription(chiamataEntrante.offer)
+        new RTCSessionDescription(chiamata.offer)
       )
+
+      await aggiungiCandidatiInAttesa(peer)
 
       const answer = await peer.createAnswer()
       await peer.setLocalDescription(answer)
 
       socket.emit('answer-call', {
-        to: chiamataEntrante.from,
+        to: chiamata.from,
         answer
       })
 
-      setChiamante(chiamataEntrante.from)
       setChiamataEntrante(null)
       setStato('Connessione in corso...')
-    } catch (errore) {
-      socket.emit('reject-call', { to: chiamataEntrante.from })
+    } catch (error) {
+      console.error(error)
+      socket.emit('reject-call', {
+        to: chiamataEntrante.from
+      })
       chiudiChiamata('Microfono non disponibile')
     }
   }
 
   function rifiuta() {
     if (chiamataEntrante) {
-      socket.emit('reject-call', { to: chiamataEntrante.from })
+      socket.emit('reject-call', {
+        to: chiamataEntrante.from
+      })
     }
+
     chiudiChiamata('Chiamata rifiutata')
   }
 
@@ -195,29 +238,40 @@ export default function App() {
     }
 
     function chiamataRicevuta(dati) {
-      offertaRef.current = dati.offer
       setChiamataEntrante(dati)
       setStato('Chiamata in arrivo!')
     }
 
     async function chiamataAccettata({ answer }) {
-      if (peerRef.current) {
-        await peerRef.current.setRemoteDescription(
+      const peer = peerRef.current
+
+      if (!peer) return
+
+      try {
+        await peer.setRemoteDescription(
           new RTCSessionDescription(answer)
         )
+
+        await aggiungiCandidatiInAttesa(peer)
         setStato('Connessione in corso...')
+      } catch (error) {
+        console.error('Errore risposta:', error)
+        chiudiChiamata('Errore connessione audio')
       }
     }
 
     async function candidatoRicevuto({ candidate }) {
-      if (peerRef.current && candidate) {
-        try {
-          await peerRef.current.addIceCandidate(
-            new RTCIceCandidate(candidate)
-          )
-        } catch (errore) {
-          console.error('Errore ICE:', errore)
-        }
+      const peer = peerRef.current
+
+      if (!peer || !peer.remoteDescription) {
+        candidatiRef.current.push(candidate)
+        return
+      }
+
+      try {
+        await peer.addIceCandidate(new RTCIceCandidate(candidate))
+      } catch (error) {
+        console.error('Errore ICE:', error)
       }
     }
 
@@ -242,9 +296,11 @@ export default function App() {
       socket.off('call-rejected')
       socket.off('call-ended')
       socket.disconnect()
+
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop())
       }
+
       if (peerRef.current) peerRef.current.close()
     }
   }, [numeroPersonale])
@@ -308,7 +364,7 @@ export default function App() {
                     {tasti.map(tasto => (
                       <button
                         key={tasto}
-                        onClick={() => setNumero(n => n + tasto)}
+                        onClick={() => setNumero(n => (n + tasto).slice(0, 6))}
                       >
                         {tasto}
                       </button>
@@ -319,7 +375,10 @@ export default function App() {
                     ☎ &nbsp; CHIAMA
                   </button>
 
-                  <button className="clear" onClick={() => setNumero(n => n.slice(0, -1))}>
+                  <button
+                    className="clear"
+                    onClick={() => setNumero(n => n.slice(0, -1))}
+                  >
                     Cancella ultima cifra
                   </button>
 
@@ -336,13 +395,12 @@ export default function App() {
                     </div>
                   )}
 
-                  {(stato === 'Chiamata connessa' ||
-                    stato === 'Connessione in corso...' ||
-                    stato === 'Chiamata in corso...') && (
+                  {stato.includes('Chiamata') ||
+                  stato.includes('Connessione') ? (
                     <button className="clear" onClick={termina}>
                       TERMINA CHIAMATA
                     </button>
-                  )}
+                  ) : null}
 
                   <p>{stato}</p>
                 </>
@@ -368,7 +426,7 @@ export default function App() {
             <div className="home-button" />
           </div>
 
-          <audio id="audio-remoto" autoPlay />
+          <audio id="audio-remoto" autoPlay playsInline />
 
           <p className="footnote">
             Le chiamate vocali funzionano tra utenti collegati al server.
